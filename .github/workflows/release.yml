@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: haip
+          POSTGRES_PASSWORD: haip
+          POSTGRES_DB: haip_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm build
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Type Check
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm test
+        env:
+          DATABASE_URL: postgresql://haip:haip@localhost:5432/haip_test
+          REDIS_URL: redis://localhost:6379
+
+  release:
+    name: Auto Release
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest tag and compute next version
+        id: version
+        run: |
+          # Get the latest semver tag
+          LATEST=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+          if [ -z "$LATEST" ]; then
+            NEXT="v1.0.0"
+            PREV=""
+          else
+            PREV="$LATEST"
+            # Strip the v prefix
+            VER="${LATEST#v}"
+            MAJOR=$(echo "$VER" | cut -d. -f1)
+            MINOR=$(echo "$VER" | cut -d. -f2)
+            PATCH=$(echo "$VER" | cut -d. -f3)
+
+            # Roll: patch 0-9, then minor 0-9, then major
+            if [ "$PATCH" -lt 9 ]; then
+              PATCH=$((PATCH + 1))
+            elif [ "$MINOR" -lt 9 ]; then
+              MINOR=$((MINOR + 1))
+              PATCH=0
+            else
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+            fi
+
+            NEXT="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          # Check if there are new commits since last tag
+          if [ -n "$PREV" ]; then
+            COMMITS=$(git rev-list ${PREV}..HEAD --count)
+            if [ "$COMMITS" -eq 0 ]; then
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "No new commits since $PREV — skipping release"
+              exit 0
+            fi
+          fi
+
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "next=$NEXT" >> $GITHUB_OUTPUT
+          echo "prev=$PREV" >> $GITHUB_OUTPUT
+          echo "Next version: $NEXT (previous: ${PREV:-none})"
+
+      - name: Create tag
+        if: steps.version.outputs.skip == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a ${{ steps.version.outputs.next }} -m "Release ${{ steps.version.outputs.next }}"
+          git push origin ${{ steps.version.outputs.next }}
+
+      - name: Generate changelog
+        if: steps.version.outputs.skip == 'false'
+        run: |
+          PREV="${{ steps.version.outputs.prev }}"
+          NEXT="${{ steps.version.outputs.next }}"
+
+          echo "## What's Changed" > changelog.md
+          echo "" >> changelog.md
+
+          if [ -n "$PREV" ]; then
+            git log ${PREV}..HEAD~0 --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+            echo "" >> changelog.md
+            echo "" >> changelog.md
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV}...${NEXT}" >> changelog.md
+          else
+            git log --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+          fi
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.next }}
+          body_path: changelog.md
+          generate_release_notes: false
+          draft: false

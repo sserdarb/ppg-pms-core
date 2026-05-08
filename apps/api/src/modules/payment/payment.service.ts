@@ -1,0 +1,489 @@
+import {
+  Injectable,
+  Inject,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+} from '@nestjs/common';
+import { eq, and, sql } from 'drizzle-orm';
+import { Decimal } from 'decimal.js';
+import { payments } from '@telivityhaip/database';
+import { DRIZZLE } from '../../database/database.module';
+import { WebhookService } from '../webhook/webhook.service';
+import { FolioService } from '../folio/folio.service';
+import { PAYMENT_GATEWAY } from './interfaces/payment-gateway.interface';
+import type { PaymentGateway } from './interfaces/payment-gateway.interface';
+import { PaymentGatewayRegistry } from './payment-gateway-registry';
+import { CreatePaymentDto } from './dto/create-payment.dto';
+import { AuthorizePaymentDto } from './dto/authorize-payment.dto';
+import { ListPaymentsDto } from './dto/list-payments.dto';
+
+const CARD_METHODS = ['credit_card', 'debit_card', 'vcc'];
+
+@Injectable()
+export class PaymentService {
+  constructor(
+    @Inject(DRIZZLE) private readonly db: any,
+    private readonly folioService: FolioService,
+    @Inject(PAYMENT_GATEWAY) private readonly defaultGateway: PaymentGateway,
+    private readonly webhookService: WebhookService,
+    private readonly gatewayRegistry: PaymentGatewayRegistry,
+  ) {}
+
+  /**
+   * Resolve the gateway to use for a specific call.
+   *
+   * Priority: explicit `gatewayProvider` on the DTO/payment row → the registry
+   * (multi-provider). Falls back to the legacy single-gateway binding so
+   * existing call sites that don't set a provider keep working.
+   */
+  private resolveGateway(provider?: string | null): PaymentGateway {
+    if (provider && this.gatewayRegistry.has(provider)) {
+      return this.gatewayRegistry.get(provider);
+    }
+    return this.defaultGateway;
+  }
+
+  async recordPayment(dto: CreatePaymentDto) {
+    if (CARD_METHODS.includes(dto.method)) {
+      throw new BadRequestException(
+        `Card payments must use the authorize flow. Use POST /payments/authorize instead.`,
+      );
+    }
+
+    const folio = await this.folioService.findById(dto.folioId, dto.propertyId);
+    if (folio.status !== 'open') {
+      throw new BadRequestException('Cannot record payment on a folio that is not open');
+    }
+
+    const [payment] = await this.db
+      .insert(payments)
+      .values({
+        ...dto,
+        status: 'captured',
+        processedAt: new Date(),
+      })
+      .returning();
+
+    await this.folioService.recalculateBalance(dto.folioId, dto.propertyId);
+
+    await this.webhookService.emit(
+      'payment.received',
+      'payment',
+      payment.id,
+      { folioId: dto.folioId, method: payment.method, amount: payment.amount, status: 'captured' },
+      dto.propertyId,
+    );
+
+    return payment;
+  }
+
+  async authorizePayment(dto: AuthorizePaymentDto) {
+    const folio = await this.folioService.findById(dto.folioId, dto.propertyId);
+    if (folio.status !== 'open') {
+      throw new BadRequestException('Cannot authorize payment on a folio that is not open');
+    }
+
+    // Gateway expects a number; keep the canonical stored value as the string.
+    // Decimal keeps precision through the conversion boundary.
+    const gateway = this.resolveGateway(dto.gatewayProvider);
+    const result = await gateway.authorize(
+      dto.gatewayPaymentToken,
+      new Decimal(dto.amount).toNumber(),
+      dto.currencyCode,
+      { propertyId: dto.propertyId },
+    );
+
+    // Method on the payment row reflects the rail, not the gateway. Card
+    // gateways (stripe, adyen, …) record as 'credit_card'; Instapay records
+    // as 'instapay' so reconciliation buckets the IPN settlement separately.
+    const paymentMethod = dto.gatewayProvider === 'instapay' ? 'instapay' : 'credit_card';
+
+    if (!result.success) {
+      const [failed] = await this.db
+        .insert(payments)
+        .values({
+          folioId: dto.folioId,
+          propertyId: dto.propertyId,
+          method: paymentMethod,
+          amount: dto.amount,
+          currencyCode: dto.currencyCode,
+          status: 'failed',
+          gatewayProvider: dto.gatewayProvider,
+          gatewayPaymentToken: dto.gatewayPaymentToken,
+          gatewayTransactionId: result.transactionId,
+          cardLastFour: dto.cardLastFour,
+          cardBrand: dto.cardBrand,
+          notes: result.errorMessage,
+        })
+        .returning();
+
+      await this.webhookService.emit(
+        'payment.failed',
+        'payment',
+        failed.id,
+        { folioId: dto.folioId, error: result.errorMessage },
+        dto.propertyId,
+      );
+
+      throw new BadRequestException(`Authorization failed: ${result.errorMessage}`);
+    }
+
+    const preAuthExpiry = dto.preAuthExpiresAt
+      ? new Date(dto.preAuthExpiresAt)
+      : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // Default 7 days
+
+    const [payment] = await this.db
+      .insert(payments)
+      .values({
+        folioId: dto.folioId,
+        propertyId: dto.propertyId,
+        method: paymentMethod,
+        amount: dto.amount,
+        currencyCode: dto.currencyCode,
+        status: 'authorized',
+        isPreAuthorization: true,
+        preAuthExpiresAt: preAuthExpiry,
+        gatewayProvider: dto.gatewayProvider,
+        gatewayPaymentToken: dto.gatewayPaymentToken,
+        gatewayTransactionId: result.transactionId,
+        cardLastFour: dto.cardLastFour,
+        cardBrand: dto.cardBrand,
+        notes: dto.notes,
+      })
+      .returning();
+
+    // Do NOT recalculate balance — pre-auth is a hold, not a capture
+    await this.webhookService.emit(
+      'payment.received',
+      'payment',
+      payment.id,
+      { folioId: dto.folioId, status: 'authorized', amount: payment.amount },
+      dto.propertyId,
+    );
+
+    // `redirectUrl` is non-empty for hosted-checkout providers like Instapay's
+    // bank-app consent flow — surfaced to the booking engine so it can hand
+    // the guest off to their bank and resume on the callback URL.
+    return { ...payment, redirectUrl: result.redirectUrl };
+  }
+
+  /**
+   * Capture an authorized payment.
+   *
+   * Concurrency-safe two-phase flow:
+   *  1. Atomic conditional UPDATE from `authorized` → `captured` in a short tx.
+   *     If the update matches zero rows, another request already claimed it.
+   *  2. Call Stripe OUTSIDE the tx with an idempotency key. If Stripe fails,
+   *     revert the row back to `authorized` so the client can retry.
+   *
+   * This prevents the classic read-then-act race where two requests both see
+   * `authorized` and both call Stripe. The DB wins the race; Stripe's
+   * idempotency key provides a second line of defense if a retry slips past.
+   */
+  async capturePayment(id: string, propertyId: string) {
+    // Phase 1: atomically claim the payment (authorized → captured)
+    const [claimed] = await this.db
+      .update(payments)
+      .set({
+        status: 'captured',
+        processedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(payments.id, id),
+          eq(payments.propertyId, propertyId),
+          eq(payments.status, 'authorized'),
+        ),
+      )
+      .returning();
+
+    if (!claimed) {
+      // Either the payment doesn't exist, doesn't belong to this property,
+      // or isn't in `authorized` state. Distinguish for a useful error.
+      const existing = await this.db
+        .select()
+        .from(payments)
+        .where(and(eq(payments.id, id), eq(payments.propertyId, propertyId)));
+      if (!existing || existing.length === 0) {
+        throw new NotFoundException(`Payment ${id} not found`);
+      }
+      throw new ConflictException(
+        `Cannot capture payment with status '${existing[0].status}' (expected 'authorized')`,
+      );
+    }
+
+    // Phase 2: call the gateway outside the DB tx with an idempotency key
+    const gateway = this.resolveGateway(claimed.gatewayProvider);
+    const result = await gateway.capture(
+      claimed.gatewayTransactionId,
+      new Decimal(claimed.amount).toNumber(),
+      { idempotencyKey: `cap_${id}`, propertyId },
+    );
+
+    if (!result.success) {
+      // Revert to authorized so the caller can retry
+      await this.db
+        .update(payments)
+        .set({ status: 'authorized', processedAt: null, updatedAt: new Date() })
+        .where(and(eq(payments.id, id), eq(payments.propertyId, propertyId)));
+      throw new BadRequestException(`Capture failed: ${result.errorMessage}`);
+    }
+
+    await this.folioService.recalculateBalance(claimed.folioId, propertyId);
+
+    await this.webhookService.emit(
+      'payment.received',
+      'payment',
+      claimed.id,
+      { folioId: claimed.folioId, status: 'captured', amount: claimed.amount },
+      propertyId,
+    );
+
+    return claimed;
+  }
+
+  /**
+   * Void an authorized payment. Same two-phase concurrency-safe pattern as capture.
+   */
+  async voidPayment(id: string, propertyId: string) {
+    // Phase 1: atomically claim the payment (authorized → voided)
+    const [claimed] = await this.db
+      .update(payments)
+      .set({ status: 'voided', updatedAt: new Date() })
+      .where(
+        and(
+          eq(payments.id, id),
+          eq(payments.propertyId, propertyId),
+          eq(payments.status, 'authorized'),
+        ),
+      )
+      .returning();
+
+    if (!claimed) {
+      const existing = await this.db
+        .select()
+        .from(payments)
+        .where(and(eq(payments.id, id), eq(payments.propertyId, propertyId)));
+      if (!existing || existing.length === 0) {
+        throw new NotFoundException(`Payment ${id} not found`);
+      }
+      throw new ConflictException(
+        `Cannot void payment with status '${existing[0].status}' (expected 'authorized')`,
+      );
+    }
+
+    const gateway = this.resolveGateway(claimed.gatewayProvider);
+    const result = await gateway.void(claimed.gatewayTransactionId, {
+      idempotencyKey: `void_${id}`,
+      propertyId,
+    });
+
+    if (!result.success) {
+      await this.db
+        .update(payments)
+        .set({ status: 'authorized', updatedAt: new Date() })
+        .where(and(eq(payments.id, id), eq(payments.propertyId, propertyId)));
+      throw new BadRequestException(`Void failed: ${result.errorMessage}`);
+    }
+
+    await this.webhookService.emit(
+      'payment.failed',
+      'payment',
+      claimed.id,
+      { folioId: claimed.folioId, status: 'voided' },
+      propertyId,
+    );
+
+    return claimed;
+  }
+
+  /**
+   * Refund a captured/settled payment.
+   *
+   * Two-phase concurrency-safe flow:
+   *  1. Conditional UPDATE claims the original payment by transitioning its
+   *     status to `refunded` or `partially_refunded`. A status guard on
+   *     `captured`/`settled` ensures only one concurrent request succeeds.
+   *  2. Stripe call happens outside the DB tx with an idempotency key.
+   *     On failure, revert the status to what it was.
+   */
+  async refundPayment(id: string, propertyId: string, amount?: string) {
+    // Load the original payment to decide partial vs full and sanity check status
+    const [original] = await this.db
+      .select()
+      .from(payments)
+      .where(and(eq(payments.id, id), eq(payments.propertyId, propertyId)));
+
+    if (!original) {
+      throw new NotFoundException(`Payment ${id} not found`);
+    }
+    // Bug 3: allow multiple partial refunds — entry from captured, settled,
+    // AND partially_refunded. Only `refunded` (fully refunded) is terminal.
+    if (!['captured', 'settled', 'partially_refunded'].includes(original.status)) {
+      throw new BadRequestException(
+        `Cannot refund payment with status '${original.status}'`,
+      );
+    }
+
+    const refundAmount = amount ?? original.amount;
+    // Money math via decimal.js — keep as strings everywhere
+    const refundAmountDec = new Decimal(refundAmount);
+    const originalAmountDec = new Decimal(original.amount);
+    if (refundAmountDec.lte(0)) {
+      throw new BadRequestException('Refund amount must be positive');
+    }
+
+    // Bug 3: sum existing refunds to compute remaining refundable amount.
+    // Refund rows live in the same `payments` table with originalPaymentId
+    // pointing back to the captured payment, stored as negative amounts.
+    const existingRefunds = await this.db
+      .select()
+      .from(payments)
+      .where(
+        and(
+          eq(payments.originalPaymentId, id),
+          eq(payments.propertyId, propertyId),
+        ),
+      );
+    const alreadyRefundedDec = (existingRefunds ?? []).reduce(
+      (sum: Decimal, r: any) => sum.plus(new Decimal(r.amount).abs()),
+      new Decimal(0),
+    );
+    const remainingDec = originalAmountDec.minus(alreadyRefundedDec);
+
+    if (refundAmountDec.gt(remainingDec)) {
+      throw new BadRequestException(
+        `Refund amount ${refundAmountDec.toFixed(2)} exceeds remaining refundable amount ${remainingDec.toFixed(2)}`,
+      );
+    }
+
+    // After this refund, will the total reach the original? If so, mark the
+    // original fully refunded; otherwise leave (or set) to partially_refunded.
+    const totalAfterDec = alreadyRefundedDec.plus(refundAmountDec);
+    const fullyRefundedAfter = totalAfterDec.gte(originalAmountDec);
+    const newStatus = fullyRefundedAfter ? 'refunded' : 'partially_refunded';
+    const prevStatus = original.status;
+
+    // Phase 1: atomically claim the original by transitioning its status.
+    // Accept prevStatus of captured/settled/partially_refunded. A second
+    // refund still races safely because the guard requires the exact
+    // prevStatus we read — if another refund just landed, our claim fails.
+    const [claimed] = await this.db
+      .update(payments)
+      .set({ status: newStatus, updatedAt: new Date() })
+      .where(
+        and(
+          eq(payments.id, id),
+          eq(payments.propertyId, propertyId),
+          eq(payments.status, prevStatus),
+        ),
+      )
+      .returning();
+
+    if (!claimed) {
+      throw new ConflictException(
+        `Payment ${id} is no longer in '${prevStatus}' state — concurrent refund?`,
+      );
+    }
+
+    // Phase 2: call Stripe with a UNIQUE idempotency key per refund attempt.
+    // Bug 3: the previous `ref_${id}` key caused Stripe to dedupe the second
+    // partial refund against the first. Include the running total so each
+    // partial refund gets a distinct key while a retry of the same logical
+    // refund (same running total) is still deduped.
+    const idempotencyKey = `ref_${id}_${totalAfterDec.toFixed(2)}`;
+    const gateway = this.resolveGateway(original.gatewayProvider);
+    const result = await gateway.refund(
+      original.gatewayTransactionId,
+      refundAmountDec.toNumber(),
+      { idempotencyKey, propertyId },
+    );
+
+    if (!result.success) {
+      // Revert status
+      await this.db
+        .update(payments)
+        .set({ status: prevStatus, updatedAt: new Date() })
+        .where(and(eq(payments.id, id), eq(payments.propertyId, propertyId)));
+      throw new BadRequestException(`Refund failed: ${result.errorMessage}`);
+    }
+
+    // Create refund payment record (negative amount via decimal.js)
+    const refundRowAmount = refundAmountDec.negated().toFixed(2);
+    const [refund] = await this.db
+      .insert(payments)
+      .values({
+        folioId: original.folioId,
+        propertyId,
+        method: original.method,
+        amount: refundRowAmount,
+        currencyCode: original.currencyCode,
+        status: 'captured',
+        originalPaymentId: id,
+        gatewayProvider: original.gatewayProvider,
+        gatewayTransactionId: result.transactionId,
+        processedAt: new Date(),
+        notes: `Refund of payment ${id}`,
+      })
+      .returning();
+
+    await this.folioService.recalculateBalance(original.folioId, propertyId);
+
+    await this.webhookService.emit(
+      'payment.refunded',
+      'payment',
+      refund.id,
+      { folioId: original.folioId, originalPaymentId: id, refundAmount },
+      propertyId,
+    );
+
+    return refund;
+  }
+
+  async findById(id: string, propertyId: string) {
+    const [payment] = await this.db
+      .select()
+      .from(payments)
+      .where(and(eq(payments.id, id), eq(payments.propertyId, propertyId)));
+    if (!payment) {
+      throw new NotFoundException(`Payment ${id} not found`);
+    }
+    return payment;
+  }
+
+  async list(dto: ListPaymentsDto) {
+    const conditions: any[] = [eq(payments.propertyId, dto.propertyId)];
+
+    if (dto.folioId) conditions.push(eq(payments.folioId, dto.folioId));
+    if (dto.status) conditions.push(eq(payments.status, dto.status as any));
+    if (dto.method) conditions.push(eq(payments.method, dto.method as any));
+
+    const page = dto.page ?? 1;
+    const limit = dto.limit ?? 20;
+    const offset = (page - 1) * limit;
+    const whereClause = and(...conditions);
+
+    const [data, countResult] = await Promise.all([
+      this.db
+        .select()
+        .from(payments)
+        .where(whereClause)
+        .limit(limit)
+        .offset(offset)
+        .orderBy(payments.createdAt),
+      this.db
+        .select({ count: sql<number>`count(*)` })
+        .from(payments)
+        .where(whereClause),
+    ]);
+
+    return {
+      data,
+      total: Number(countResult[0]?.count ?? 0),
+      page,
+      limit,
+    };
+  }
+}

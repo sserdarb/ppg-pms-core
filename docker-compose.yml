@@ -1,0 +1,148 @@
+version: '3.8'
+
+services:
+  # PostgreSQL — multi-tenant from day one.
+  # Service renamed from "postgres" to "pgdb" to abandon a stale volume
+  # left over from earlier failed deploys (postgres init only honors
+  # POSTGRES_PASSWORD on first init; subsequent restarts keep the old
+  # password baked into the volume, causing auth failures).
+  pgdb:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-haip}
+      # Sourced from Coolify secret; never inline a password here. Existing
+      # volume keeps its initdb password until reset (see fix(compose):
+      # rename postgres service to pgdb commit for context).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-haip}
+    volumes:
+      - pgdb-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U haip']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis — session cache, rate caching, pub/sub for events, BullMQ
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # HAIP API
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      # Coolify magic env: presence of SERVICE_FQDN_<SERVICE>_<PORT> tells the
+      # platform proxy to bind this container to the application FQDN. Coolify
+      # rewrites the value at deploy time.
+      SERVICE_FQDN_API_3000: /
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-haip}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@pgdb:5432/${POSTGRES_DB:-haip}
+      POSTGRES_HOST: pgdb
+      POSTGRES_USER: ${POSTGRES_USER:-haip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-haip}
+      REDIS_URL: redis://redis:6379
+      STRIPE_MODE: mock
+      AUTH_ENABLED: 'false'
+      BOOKING_COM_BASE_URL: http://mock-bookingcom:4000/ota
+      BOOKING_COM_USERNAME: haip_test
+      BOOKING_COM_PASSWORD: test_password
+      BOOKING_COM_HOTEL_ID: MOCK_HOTEL_1
+      SITEMINDER_BASE_URL: http://mock-siteminder:4001/pmsxchange
+      SITEMINDER_USERNAME: haip_test
+      SITEMINDER_PASSWORD: test_password
+      SITEMINDER_HOTEL_CODE: MOCK_SM_HOTEL
+    expose:
+      - '3000'
+    networks:
+      - default
+      - coolify
+    labels:
+      # NOTE: Coolify (4.0.0-beta.460) does not interpolate ${VAR} in compose
+      # labels — neither custom envs (PUBLIC_HOST) nor Coolify's own
+      # COOLIFY_FQDN survive label parsing. Tried both, both produced literal
+      # ${...} hosts and traefik refused the route. Hardcoding the spike FQDN
+      # back in for now; the right fix is moving traefik config out of compose
+      # labels entirely (e.g. a dedicated traefik dynamic config file or a
+      # Coolify "Service Domain" UI binding once the API endpoint for it is
+      # fixed by upstream).
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - "traefik.http.routers.ppg-pms-api-http.rule=Host(`hgg4os8g44ksk8k8gs444w0k.76.13.0.113.sslip.io`)"
+      - traefik.http.routers.ppg-pms-api-http.entrypoints=http
+      - traefik.http.routers.ppg-pms-api-http.service=ppg-pms-api
+      - traefik.http.services.ppg-pms-api.loadbalancer.server.port=3000
+    depends_on:
+      pgdb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Keycloak — disabled for spike; AUTH_ENABLED=false on API.
+  # Re-enable later via `--profile auth` once OIDC is wired in.
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    profiles: [auth]
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://pgdb:5432/keycloak
+      KC_DB_USERNAME: ${POSTGRES_USER:-haip}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      KC_HEALTH_ENABLED: 'true'
+    volumes:
+      - ./keycloak/haip-realm.json:/opt/keycloak/data/import/haip-realm.json:ro
+    expose:
+      - '8080'
+    depends_on:
+      pgdb:
+        condition: service_healthy
+
+  # Mock Booking.com Connectivity Partner API (optional, for channel testing)
+  mock-bookingcom:
+    build:
+      context: ./tools/mock-bookingcom
+      dockerfile: Dockerfile
+    environment:
+      PORT: 4000
+      AUTH_USER: haip_test
+      AUTH_PASS: test_password
+    expose:
+      - '4000'
+    profiles:
+      - channels
+
+  # Mock SiteMinder pmsXchange API (optional, for channel testing)
+  mock-siteminder:
+    build:
+      context: ./tools/mock-siteminder
+      dockerfile: Dockerfile
+    environment:
+      PORT: 4001
+      AUTH_USER: haip_test
+      AUTH_PASS: test_password
+    expose:
+      - '4001'
+    profiles:
+      - channels
+
+volumes:
+  pgdb-data:
+  redis-data:
+
+networks:
+  default:
+  coolify:
+    external: true
