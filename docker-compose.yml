@@ -78,7 +78,7 @@ services:
       # fixed by upstream).
       - traefik.enable=true
       - traefik.docker.network=coolify
-      - "traefik.http.routers.ppg-pms-api-http.rule=Host(`hgg4os8g44ksk8k8gs444w0k.76.13.0.113.sslip.io`)"
+      - "traefik.http.routers.ppg-pms-api-http.rule=Host(`ik3azu9mvakvnq9tky27i78o.161.97.132.250.sslip.io`)"
       - traefik.http.routers.ppg-pms-api-http.entrypoints=http
       - traefik.http.routers.ppg-pms-api-http.service=ppg-pms-api
       - traefik.http.services.ppg-pms-api.loadbalancer.server.port=3000
